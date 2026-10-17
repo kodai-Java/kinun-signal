@@ -9,11 +9,32 @@ use crate::models::{
 use crate::services::{fmp::FmpClient, line::LineClient, llm::{LlmClient, LlmDcfParams}};
 
 pub async fn init_pool(database_url: &str) -> anyhow::Result<PgPool> {
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(database_url)
-        .await?;
+    // Attempt to connect to the PostgreSQL database with retries, handling the case where the container
+    // may not be ready yet when the backend starts. This prevents a startup failure with "role \"postgres\" does not exist".
+    let mut attempts = 0usize;
+    let max_attempts = 20usize;
+    let mut pool: Option<PgPool> = None;
+    while attempts < max_attempts {
+        attempts += 1;
+        match PgPoolOptions::new()
+            .max_connections(10)
+            .connect(database_url)
+            .await {
+            Ok(p) => {
+                pool = Some(p);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("Database connection attempt {}/{} failed: {}", attempts, max_attempts, e);
+                // Exponential backoff: increase wait time up to 5 seconds.
+                let wait_secs = std::cmp::min(2 * attempts as u64, 5);
+                tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            }
+        }
+    }
+    let pool = pool.ok_or_else(|| anyhow::anyhow!("Failed to connect to PostgreSQL after {} attempts", max_attempts))?;
 
+    // Run migrations after establishing the connection.
     sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
 }

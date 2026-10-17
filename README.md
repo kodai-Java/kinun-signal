@@ -46,8 +46,7 @@ All functionality follows the strict specifications in `AGENTS.md` and works on 
    ```bash
    cd ../frontend
    npm install
-   npm run dev   # Development server on http://localhost:3000
-   ```
+   npm run dev   # Development server on http://localhost:3000 ```
    You can also build for production with `npm run build`.
 
 ---
