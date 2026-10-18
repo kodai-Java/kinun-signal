@@ -11,9 +11,10 @@ set -euo pipefail
 
 # ---- Configuration ------------------------------------------------
 # Change these values as needed
-export AWS_PROFILE="nakajima"        # IAM profile that has Lightsail permissions
-AWS_REGION="ap-northeast-1"
-SERVICE_NAME="stock-analyst"        # Lightsail container service name
+# Use env vars or defaults for profile, region, service name
+AWS_PROFILE="${AWS_PROFILE:-}"
+AWS_REGION="${AWS_REGION:-ap-northeast-1}"
+SERVICE_NAME="${SERVICE_NAME:-stock-analyst}"
 # 指定したいIPアドレス（CIDR形式）をスペース区切りで列挙してください。
 # 例: "203.0.113.5/32 198.51.100.12/32"
 ALLOWED_IPS="${1:-}"                # 第1引数でIPリストを受け取る (省略時は自動取得)
