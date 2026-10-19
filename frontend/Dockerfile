@@ -1,9 +1,21 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
+COPY package*.json ./
+RUN npm ci
 COPY . .
-RUN npm ci && npm run build
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+RUN npm run build
 
-FROM nginx:alpine
-COPY --from=builder /app/.next /usr/share/nginx/html
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;" ]
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV production
+# Next.js standalone build helps reduce image size
+# Ensure "output: 'standalone'" is in next.config.mjs if not already, or we just copy .next
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+
+EXPOSE 3000
+CMD ["npm", "run", "start"]
