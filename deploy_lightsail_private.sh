@@ -19,8 +19,30 @@ BUNDLE_ID="${BUNDLE_ID:-medium_2_0}" # 2 vCPU, 4GB RAM is recommended for Rust/N
 log(){ echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] $*"; }
 
 # ---- Verify AWS CLI works ---------------------------------------
+# ---- Verify AWS CLI works ---------------------------------------
 log "Checking AWS identity..."
-aws sts get-caller-identity --profile "$AWS_PROFILE" --region "$AWS_REGION" || { log "Failed to verify AWS identity."; exit 1; }
+if ! aws sts get-caller-identity --profile "$AWS_PROFILE" --region "$AWS_REGION" >/dev/null 2>&1; then
+    log "AWS credentials not found or SSO not configured."
+
+    # Check if SSO config exists for this profile
+    if aws configure get sso_start_url --profile "$AWS_PROFILE" >/dev/null 2>&1; then
+        log "Attempting SSO login..."
+        if [ -n "$AWS_PROFILE" ]; then
+            aws sso login --profile "$AWS_PROFILE" || { log "SSO login failed for profile $AWS_PROFILE"; exit 1; }
+        else
+            aws sso login || { log "SSO login failed for default profile"; exit 1; }
+        fi
+        # Retry identity check after login
+        if ! aws sts get-caller-identity --profile "$AWS_PROFILE" --region "$AWS_REGION" >/dev/null 2>&1; then
+            log "Failed to verify AWS identity after SSO login."
+            exit 1
+        fi
+    else
+        log "⚠️  No SSO configuration found for profile '$AWS_PROFILE'."
+        log "Run 'aws configure sso' to set it up, or use a profile with static credentials."
+        exit 1
+    fi
+fi
 
 # ---- Check if instance exists -----------------------------------
 log "Checking if Lightsail instance '$INSTANCE_NAME' exists..."
