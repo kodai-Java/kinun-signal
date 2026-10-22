@@ -1,115 +1,111 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------
 # deploy_lightsail_private.sh
-# Deploy the Personal Stock Analyst app to Lightsail with a
-# private-only endpoint (no Client VPN). Access via:
-#   aws lightsail open-container-service-ssh --service-name $SERVICE_NAME --port 80 --local-port 8080
+# Deploy the Personal Stock Analyst app to a Lightsail OS instance
+# (VPS) rather than the Container Service, to allow for Tailscale
+# integration on the Host OS.
 # ------------------------------------------------------------
 
 set -euo pipefail
 
 # ---- Configuration ------------------------------------------------
-# Use env vars or defaults for profile, region, service name
 AWS_PROFILE="${AWS_PROFILE:-}"
 AWS_REGION="${AWS_REGION:-ap-northeast-1}"
-SERVICE_NAME="${SERVICE_NAME:-stock-analyst}"
-REPO_BACKEND="${SERVICE_NAME}-backend"
-REPO_FRONTEND="${SERVICE_NAME}-frontend"
+INSTANCE_NAME="${INSTANCE_NAME:-stock-analyst-instance}"
+BLUEPRINT_ID="${BLUEPRINT_ID:-ubuntu_22_04}"
+BUNDLE_ID="${BUNDLE_ID:-medium_2_0}" # 2 vCPU, 4GB RAM is recommended for Rust/Node builds, or small_2_0 for 2GB
 # ------------------------------------------------------------
 
 log(){ echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] $*"; }
 
 # ---- Verify AWS CLI works ---------------------------------------
+# ---- Verify AWS CLI works ---------------------------------------
 log "Checking AWS identity..."
-aws sts get-caller-identity --profile "$AWS_PROFILE" --region "$AWS_REGION"
+if ! aws sts get-caller-identity --profile "$AWS_PROFILE" --region "$AWS_REGION" >/dev/null 2>&1; then
+    log "AWS credentials not found or SSO not configured."
 
-# ---- Ensure ECR repositories exist --------------------------------
-log "Creating/ensuring ECR repositories..."
-aws ecr create-repository --repository-name "$REPO_BACKEND" --region "$AWS_REGION" --profile "$AWS_PROFILE" || true
-aws ecr create-repository --repository-name "$REPO_FRONTEND" --region "$AWS_REGION" --profile "$AWS_PROFILE" || true
+    # Check if SSO config exists for this profile
+    if aws configure get sso_start_url --profile "$AWS_PROFILE" >/dev/null 2>&1; then
+        log "Attempting SSO login..."
+        if [ -n "$AWS_PROFILE" ]; then
+            aws sso login --profile "$AWS_PROFILE" || { log "SSO login failed for profile $AWS_PROFILE"; exit 1; }
+        else
+            aws sso login || { log "SSO login failed for default profile"; exit 1; }
+        fi
+        # Retry identity check after login
+        if ! aws sts get-caller-identity --profile "$AWS_PROFILE" --region "$AWS_REGION" >/dev/null 2>&1; then
+            log "Failed to verify AWS identity after SSO login."
+            exit 1
+        fi
+    else
+        log "⚠️  No SSO configuration found for profile '$AWS_PROFILE'."
+        log "Run 'aws configure sso' to set it up, or use a profile with static credentials."
+        exit 1
+    fi
+fi
 
-# ---- Build Docker images ------------------------------------------
-log "Building backend image..."
-DOCKER_BUILDKIT=1 docker build -t "$REPO_BACKEND" ./backend
-log "Building frontend image..."
-DOCKER_BUILDKIT=1 docker build -t "$REPO_FRONTEND" ./frontend
+# ---- Check if instance exists -----------------------------------
+log "Checking if Lightsail instance '$INSTANCE_NAME' exists..."
+INSTANCE_EXISTS=$(aws lightsail get-instances --region "$AWS_REGION" --profile "$AWS_PROFILE" --query "instances[?name=='$INSTANCE_NAME'].name" --output text)
 
-# ---- Push images to ECR -----------------------------------------
-log "Logging in to ECR..."
-aws ecr get-login-password --region "$AWS_REGION" --profile "$AWS_PROFILE" |
-  docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+if [ -z "$INSTANCE_EXISTS" ]; then
+    log "Instance not found. Creating new Lightsail instance: $INSTANCE_NAME"
 
-log "Tagging and pushing backend..."
-aws_account=$(aws sts get-caller-identity --query Account --output text --profile "$AWS_PROFILE" --region "$AWS_REGION")
-
-docker tag "$REPO_BACKEND" "${aws_account}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO_BACKEND:latest"
-aws ecr put-image --repository-name "$REPO_BACKEND" --image-tag latest \
-    --image-manifest "$(docker inspect --format='{{json .}}' "$REPO_BACKEND")" \
-    --profile "$AWS_PROFILE" --region "$AWS_REGION" || true
-
-docker push "${aws_account}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO_BACKEND:latest"
-
-log "Tagging and pushing frontend..."
-
-docker tag "$REPO_FRONTEND" "${aws_account}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO_FRONTEND:latest"
-aws ecr put-image --repository-name "$REPO_FRONTEND" --image-tag latest \
-    --image-manifest "$(docker inspect --format='{{json .}}' "$REPO_FRONTEND")" \
-    --profile "$AWS_PROFILE" --region "$AWS_REGION" || true
-
-docker push "${aws_account}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO_FRONTEND:latest"
-
-# ---- Lightsail Container Service (private) -----------------------
-log "Creating Lightsail container service (private)..."
-# Lightsail currently does not expose a direct "private only" flag.
-# We create the service and then restrict public access via a Lightsail firewall.
-aws lightsail create-container-service \
-    --service-name "$SERVICE_NAME" \
-    --power small \
-    --scale 1 \
-    --region "$AWS_REGION" \
-    --profile "$AWS_PROFILE" || true
-
-# ---- Deploy containers --------------------------------------------
-log "Deploying containers to Lightsail..."
-cat > containers.json <<EOF
-{
-  "containers": {
-    "backend": {
-      "image": "${aws_account}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO_BACKEND:latest",
-      "environment": {},
-      "command": []
-    },
-    "frontend": {
-      "image": "${aws_account}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO_FRONTEND:latest",
-      "environment": {
-        "NEXT_PUBLIC_API_URL": "http://localhost"
-      },
-      "command": []
-    }
-  },
-  "publicEndpoint": {
-    "containerName": "frontend",
-    "containerPort": 80
-  }
-}
+    # User data script to install Docker on first boot
+    USER_DATA=$(cat <<'EOF'
+#!/bin/bash
+apt-get update
+apt-get install -y ca-certificates curl gnupg
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+  tee /etc/apt/sources.list.d/docker.list > /dev/null
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+usermod -aG docker ubuntu
 EOF
+)
 
-aws lightsail create-container-service-deployment \
-    --service-name "$SERVICE_NAME" \
-    --containers file://containers.json \
+    aws lightsail create-instances \
+        --instance-names "$INSTANCE_NAME" \
+        --availability-zone "${AWS_REGION}a" \
+        --blueprint-id "$BLUEPRINT_ID" \
+        --bundle-id "$BUNDLE_ID" \
+        --user-data "$USER_DATA" \
+        --region "$AWS_REGION" \
+        --profile "$AWS_PROFILE"
+
+    log "Waiting for instance to be running..."
+    aws lightsail wait instance-running --instance-name "$INSTANCE_NAME" --region "$AWS_REGION" --profile "$AWS_PROFILE" || true
+    # Allow some time for boot and user-data execution
+    sleep 30
+else
+    log "Instance '$INSTANCE_NAME' already exists."
+fi
+
+# ---- Get Instance IP --------------------------------------------
+INSTANCE_IP=$(aws lightsail get-instance --instance-name "$INSTANCE_NAME" --region "$AWS_REGION" --profile "$AWS_PROFILE" --query "instance.publicIpAddress" --output text)
+log "Instance Public IP: $INSTANCE_IP"
+
+# ---- Restrict public access (Lightsail firewall) ----------------
+log "Configuring Lightsail firewall..."
+# By default, Lightsail might open 22 and 80.
+# We want to CLOSE 80/443/3000/8080 to the public, because we will use Tailscale.
+# We ONLY open SSH (22) for deployment, ideally restricted to your IP, or Tailscale will handle even SSH later.
+MY_IP=$(curl -s https://checkip.amazonaws.com || echo "0.0.0.0")
+
+log "Setting public ports... Allowing SSH from $MY_IP, blocking all direct web access."
+aws lightsail put-instance-public-ports \
+    --port-infos "fromPort=22,toPort=22,protocol=TCP,cidrs=${MY_IP}/32" \
+    --instance-name "$INSTANCE_NAME" \
     --region "$AWS_REGION" \
     --profile "$AWS_PROFILE"
 
-# ---- Restrict public access (Lightsail firewall)
-log "Restricting public access – allowing only your IP for SSH tunnel"
-MY_IP=$(curl -s https://checkip.amazonaws.com)
-aws lightsail put-public-ports \
-    --port-info "fromPort=22,toPort=22,protocol=TCP,accessFrom=${MY_IP}/32" \
-    --service-name "$SERVICE_NAME" \
-    --region "$AWS_REGION" \
-    --profile "$AWS_PROFILE"
-
-log "Deployment finished."
-log "To access the service locally, run:"
-log "   aws lightsail open-container-service-ssh --service-name $SERVICE_NAME --port 80 --local-port 8080 --profile $AWS_PROFILE"
-log "Then open http://localhost:8080 in your browser."
+log "Deployment infrastructure setup finished."
+log "Next Steps:"
+log "1. SSH into the instance: ssh -i <your-lightsail-key.pem> ubuntu@$INSTANCE_IP"
+log "2. Install Tailscale: curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up"
+log "3. Clone your repo onto the instance and run 'docker compose up -d --build'"

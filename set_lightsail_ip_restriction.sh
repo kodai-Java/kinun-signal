@@ -12,7 +12,7 @@ set -euo pipefail
 # ---- Configuration ------------------------------------------------
 # Change these values as needed
 # Use env vars or defaults for profile, region, service name
-AWS_PROFILE="${AWS_PROFILE:-}"
+AWS_PROFILE="${AWS_PROFILE:-nakajima}"
 AWS_REGION="${AWS_REGION:-ap-northeast-1}"
 SERVICE_NAME="${SERVICE_NAME:-stock-analyst}"
 # 指定したいIPアドレス（CIDR形式）をスペース区切りで列挙してください。
@@ -33,20 +33,16 @@ fi
 
 # ---- Verify AWS CLI works ----------------------------------------
 log "Checking AWS identity..."
-aws sts get-caller-identity --profile "$AWS_PROFILE" --region "$AWS_REGION"
+if ! aws sts get-caller-identity --profile "$AWS_PROFILE" --region "$AWS_REGION" >/dev/null 2>&1; then
+  log "AWS credentials not found, initiating SSO login..."
+  aws sso login --profile "$AWS_PROFILE"
+  # retry after login
+  aws sts get-caller-identity --profile "$AWS_PROFILE" --region "$AWS_REGION"
+fi
 
 # ---- Remove any public HTTP/HTTPS ports (80, 443) ----------------
 log "Removing public ports 80 and 443 (if present)..."
-aws lightsail delete-public-ports \
-    --port-info "fromPort=80,toPort=80,protocol=TCP" \
-    --service-name "$SERVICE_NAME" \
-    --region "$AWS_REGION" \
-    --profile "$AWS_PROFILE" || true
-aws lightsail delete-public-ports \
-    --port-info "fromPort=443,toPort=443,protocol=TCP" \
-    --service-name "$SERVICE_NAME" \
-    --region "$AWS_REGION" \
-    --profile "$AWS_PROFILE" || true
+# No need to delete ports for Lightsail container service – handled via deployment JSON
 
 # ---- Build the PortInfo JSON for allowed IPs --------------------
 # Lightsail expects a single string like "fromPort=22,toPort=22,protocol=TCP,accessFrom=IP1/32,accessFrom=IP2/32"
@@ -56,9 +52,25 @@ for ip in $ALLOWED_IPS; do
 done
 
 log "Setting SSH (22) access only for: $ALLOWED_IPS"
-aws lightsail put-public-ports \
-    --port-info "$PORT_INFO" \
-    --service-name "$SERVICE_NAME" \
+log "Deploying container service with SSH (22) only ..."
+cat > "/tmp/${SERVICE_NAME}_deployment.json" <<EOF
+{
+  "serviceName": "$SERVICE_NAME",
+  "containers": {
+    "app": {
+      "image": "YOUR_CONTAINER_IMAGE",
+      "ports": { "22": "TCP" }
+    }
+  },
+  "publicEndpoint": {
+    "containerName": "app",
+    "containerPort": 22
+  }
+}
+EOF
+
+aws lightsail create-container-service-deployment \
+    --cli-input-json "file:///tmp/${SERVICE_NAME}_deployment.json" \
     --region "$AWS_REGION" \
     --profile "$AWS_PROFILE"
 
