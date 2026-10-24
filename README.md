@@ -1,110 +1,71 @@
-# Personal Stock Analyst (米国株理論株価算出＆アラートシステム)
+# Spot Lab 3-Tier Architecture
 
-## Overview
-This monorepo implements a personal stock analyst application that:
-- Retrieves US‑stock financial data from **Financial Modeling Prep** (FMP).
-- Uses the **argon** LLM to infer DCF parameters.
-- Calculates a theoretical price via a **Discounted Cash Flow (DCF)** model.
-- Stores data in PostgreSQL, exposes a REST API (Axum), and provides a Next.js frontend.
-- Runs daily and earnings batch jobs and sends notifications through **LINE** (or logs when mock).
+This Terraform code provisions a complete, cost-optimized, secure 3-tier architecture on AWS for spot validation purposes.
+The infrastructure is designed to be easily deployed for short testing windows and safely, fully torn down without hanging resources or extra costs.
 
-All functionality follows the strict specifications in `AGENTS.md` and works on a local MacBook Air (Apple Silicon).
+## Features
 
----
+- **Network**: Multi-AZ (ap-northeast-1a, ap-northeast-1c), isolated subnets, and a single NAT Gateway to reduce cost.
+- **Edge**: CloudFront + WAFv2 forwarding to an Application Load Balancer. Direct access to ALB is blocked using a custom secret header condition.
+- **Compute**: ECS Fargate running ARM64 containers for cost reduction. ECS Exec is enabled. Container Insights is disabled.
+- **Database**: Aurora PostgreSQL Serverless v2 setup with a Writer (1a) and Reader (1c) for failover testing.
+- **Ephemerality**: All resources are configured to skip snapshots and ignore deletion protections to ensure `terraform destroy` executes cleanly and rapidly.
 
-## Prerequisites
-- **Docker** (for PostgreSQL) – `docker compose` version >= 2.0
-- **Rust** toolchain – install via `rustup` (edition 2021, Cargo 1.70+).
-- **Node.js** (v20 or later) and **npm**.
-- **Git** (to record commits).
+## Deployment
 
----
-
-## Setup Steps
-1. **Clone the repository** (skip if you are already inside it).
+1. Ensure you are authenticated with AWS CLI.
+2. Initialize Terraform:
    ```bash
-   git clone <repo‑url>
-   cd kinun-signal
+   terraform init
    ```
-2. **Create environment file**
+3. (Optional) Provide a custom value for `custom_header_secret` via `terraform.tfvars` or let it use the default.
+4. Review the plan:
    ```bash
-   cp .env.example .env
-   # Edit .env if you have real API keys; otherwise leave the mock values.
+   terraform plan
    ```
-3. **Start PostgreSQL**
+5. Apply the configuration:
    ```bash
-   docker compose up -d
-   # Wait for the healthcheck to pass (a few seconds).
+   terraform apply
    ```
-4. **Run the backend**
-   ```bash
-   cd backend
-   cargo run
-   ```
-   The server starts on `http://localhost:8080`. On first start it seeds example tickers (AAPL, NVDA).
-5. **Run the frontend** (in a new terminal) 
-   ```bash
-   cd ../frontend
-   npm install
-   npm run dev   # Development server on http://localhost:3000 ```
-   You can also build for production with `npm run build`.
 
----
+## Verifying the Deployment
 
-## Environment Variables (`.env`)
-| Variable | Description | Default/mock value |
-|---|---|---|
-| `DATABASE_URL` | PostgreSQL connection string. | `postgres://postgres:password@localhost:5432/stock_analyst` |
-| `BACKEND_PORT` | Port for Axum server. | `8080` |
-| `NEXT_PUBLIC_API_URL` | Frontend points to backend. | `http://localhost:8080` |
-| `FMP_API_KEY` | Financial Modeling Prep API key. | `mock_fmp_key` (triggers realistic mock data) |
-| `LLM_API_BASE_URL` | Base URL of LLM endpoint. | `https://api.openai.com/v1` |
-| `LLM_API_KEY` | LLM API key. | `mock_llm_key` (mock fallback) |
-| `LLM_MODEL` | Model name – defaults to `argon`. | `argon` |
-| `LINE_CHANNEL_ACCESS_TOKEN` | LINE Messaging API token. | `mock_line_token` (logs to console) |
-| `LINE_USER_ID` | Target LINE user ID. | `mock_line_user_id` |
+### Web Access
 
-If any of the `*_KEY` variables are empty, equal to `your_…` or the mock placeholder above, the corresponding client will **automatically return realistic dummy data** so the whole flow runs without external services.
+Wait for CloudFront to deploy, then navigate to the URL output by Terraform:
 
----
-
-## API Endpoints
-- `GET /api/watchlist` – List watch‑list with latest theoretical price & divergence.
-- `POST /api/watchlist` – Add a ticker (executes FMP fetch → LLM inference → DCF → DB → LINE).
-- `DELETE /api/watchlist/:ticker` – Remove a ticker.
-- `GET /api/stocks/:ticker` – Detailed view.
-- `POST /api/stocks/:ticker/recalculate` – Manual DCF re‑calc (optional overrides).
-- **Batch jobs**:
-  - `POST /api/jobs/daily-check` – Daily price/alert + news summary.
-  - `POST /api/jobs/earnings-check` – Quarterly earnings check & re‑calc.
-- `GET /api/alerts` – Latest 30 LINE‑style alerts.
-
-Batch jobs are also automatically scheduled at **UTC 21:30 Tue‑Sat** (Japan 06:30) via `tokio‑cron‑scheduler`.
-
----
-
-## Mock Fallback Behaviour
-- **FMP client** returns realistic data for AAPL, NVDA, or a generic large‑cap US stock when `FMP_API_KEY` is missing/placeholder.
-- **LLM client** synthesises growth/WACC values from recent FCF trends when `LLM_API_KEY` is missing/placeholder.
-- **LINE client** logs the notification via `tracing::info!` and still records the entry in `alert_logs` when the token is missing/placeholder.
-
-This guarantees the UI shows data and alerts even without real API credentials.
-
----
-
-## Cleaning Up
 ```bash
-# Stop containers
-docker compose down
-# (Optional) Remove the PostgreSQL volume
-docker volume rm $(docker volume ls -qf name=pgdata)
+curl -I https://$(terraform output -raw cloudfront_domain_name)
 ```
+You should see a successful response from the sample `nginxdemos/hello` app.
 
----
+### Database Connection Testing (ECS Exec)
 
-## License
-MIT – feel free to modify and extend.
+Because `enable_execute_command = true` is set on the ECS Service, you can open an interactive session directly into one of the Fargate containers and test connectivity to the Aurora database.
 
----
+1. Find a running Task ID:
+   ```bash
+   CLUSTER_NAME=$(terraform output -raw ecs_cluster_name)
+   SERVICE_NAME=$(terraform output -raw ecs_service_name)
+   TASK_ID=$(aws ecs list-tasks --cluster $CLUSTER_NAME --service-name $SERVICE_NAME --query 'taskArns[0]' --output text | awk -F'/' '{print $3}')
+   ```
+2. Start an ECS Exec session:
+   ```bash
+   aws ecs execute-command --cluster $CLUSTER_NAME --task $TASK_ID --container app --interactive --command "/bin/sh"
+   ```
+3. Inside the container, you can verify connection to Aurora by extracting the endpoint:
+   (Note: `nginxdemos/hello` might not have `psql` or `telnet` installed by default. You can install tools or simply use `curl` or `nc` to check if the port is open).
 
-*Generated by Antigravity based on the specification in `AGENTS.md`.*
+   ```bash
+   # Example if apt is available:
+   # apt-get update && apt-get install -y postgresql-client
+   # PGPASSWORD="<password>" psql -h <writer_endpoint> -U postgres -d spotlabdb -c "\l"
+   ```
+
+## Teardown
+
+To avoid incurring any unnecessary costs, destroy the environment as soon as testing is complete. Deletion protections and final snapshots are disabled by design.
+
+```bash
+terraform destroy -auto-approve
+```
